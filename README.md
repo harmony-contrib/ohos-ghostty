@@ -13,6 +13,12 @@ maintain a second ABI. The OHOS renderer follows Ghostty's generic renderer
 model—dirty viewport rows, immutable frame data, GPU cell/background buffers,
 color-aware glyph atlas, and a dedicated render thread—on top of wgpu-native.
 
+## Install
+
+```bash
+ohpm install @ohos-rs/terminal
+```
+
 ## Stack
 
 ```
