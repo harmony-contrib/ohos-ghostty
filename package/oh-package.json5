@@ -3,7 +3,10 @@
   "version": "0.1.0",
   "description": "OpenHarmony terminal component powered by libghostty, wgpu-native-zig, and zig-napi",
   "main": "index.ets",
-  "author": "ohos-rs",
+  "author": {
+    "name": "richerfu",
+    "email": "southorange0929@foxmail.com",
+  },
   "license": "MIT",
   "keywords": [
     "terminal",
@@ -12,5 +15,6 @@
     "wgpu",
     "zig"
   ],
-  "dependencies": {}
+  "dependencies": {},
+  "repository": "https://github.com/harmony-contrib/ohos-ghostty.git",
 }
