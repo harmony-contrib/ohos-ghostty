@@ -1,0 +1,16 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "libghostty XComponent terminal example"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "Terminal example ability"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "Terminal"
+    }
+  ]
+}

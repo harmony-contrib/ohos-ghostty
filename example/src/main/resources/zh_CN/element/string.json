@@ -1,0 +1,16 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "libghostty XComponent 终端示例"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "终端示例 Ability"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "终端"
+    }
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "apiType": "stageMode",
+  "buildOption": {
+    "resOptions": {
+      "copyCodeResource": {
+        "enable": true
+      }
+    }
+  },
+  "targets": [
+    {
+      "name": "default"
+    }
+  ]
+}

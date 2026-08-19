@@ -1,0 +1,35 @@
+.{
+    .name = .terminal,
+    .version = "0.1.0",
+    .fingerprint = 0x8f7b1541d6fa2ad5,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .@"zig-napi" = .{
+            .url = "https://github.com/openharmony-zig/zig-napi/archive/732df545be0986deadca16ca49e5f43199759457.tar.gz",
+            .hash = "zig_napi-0.1.0-H6Owa-yaCADSGSbJl4wKrcJyqJcTKrEQ19Aq_i_opHo3",
+        },
+        .ohos_zig_binding = .{
+            .path = "../ohos-zig-binding",
+        },
+        .raw_window_handle = .{
+            .url = "https://github.com/openharmony-zig/raw-window-handle/archive/fff7811fb3097acab72500b1ad20a973ddccd376.tar.gz",
+            .hash = "raw_window_handle-0.1.0-V0zKBauiAADAopJuc_Ai-2lZBjb2_-E2QPV6WxeRf89D",
+        },
+        .wgpu_native_zig = .{
+            .url = "https://github.com/openharmony-zig/wgpu_native_zig/archive/f81c57ad6c46967858822b87760d3a955ff08d02.tar.gz",
+            .hash = "wgpu_native_zig-7.0.0-B9jeDDMbBABIlZUdD4AamM9uCevoHR0TL33ugDVmNEEs",
+        },
+        .ghostty = .{
+            .url = "https://github.com/ghostty-org/ghostty/archive/4c6215bb8ee186b5c829457a9a9a9c936f2337bf.tar.gz",
+            .hash = "ghostty-1.3.2-dev-5UdBCwrsRgWvCRtD7snUOYS4Pr61Pu0CyP13whv9f_0r",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "package",
+        "README.md",
+        "LICENSE",
+    },
+}

@@ -1,0 +1,12 @@
+{
+  "module": {
+    "name": "ghostty_terminal",
+    "type": "har",
+    "description": "Reusable HarmonyOS terminal surface powered by libghostty and wgpu",
+    "deviceTypes": [
+      "default",
+      "tablet",
+      "2in1"
+    ]
+  }
+}

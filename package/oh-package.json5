@@ -1,0 +1,16 @@
+{
+  "name": "@ohos-rs/terminal",
+  "version": "0.1.0",
+  "description": "OpenHarmony terminal component powered by libghostty, wgpu-native-zig, and zig-napi",
+  "main": "index.ets",
+  "author": "ohos-rs",
+  "license": "MIT",
+  "keywords": [
+    "terminal",
+    "ghostty",
+    "xcomponent",
+    "wgpu",
+    "zig"
+  ],
+  "dependencies": {}
+}
