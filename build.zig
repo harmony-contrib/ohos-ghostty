@@ -115,7 +115,11 @@ fn configureAddon(
         .target = resolved,
         .optimize = optimize,
     });
-    const wgpu = wgpuModule(b, resolved, optimize);
+    // wgpu's 32-bit OHOS path has an additional lazy source dependency. On a
+    // clean machine the dependency build intentionally exposes no module on
+    // the first configure pass while Zig fetches it; return and let Zig rerun
+    // configuration instead of turning that normal fetch cycle into a panic.
+    const wgpu = wgpuModule(b, resolved, optimize) orelse return;
 
     compile.root_module.addImport("napi", napi);
     compile.root_module.addImport("xcomponent", ohos_binding.module("xcomponent"));
@@ -134,12 +138,12 @@ fn wgpuModule(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
-) *std.Build.Module {
+) ?*std.Build.Module {
     const dep = b.dependency("wgpu_native_zig", .{
         .target = target,
         .optimize = optimize,
     });
-    return dep.builder.modules.get("wgpu") orelse @panic("wgpu dependency does not expose its module");
+    return dep.builder.modules.get("wgpu");
 }
 
 fn linkGhostty(

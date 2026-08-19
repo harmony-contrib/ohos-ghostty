@@ -1,6 +1,7 @@
 .zig-cache/
 zig-out/
 zig-pkg/
+dist/
 oh_modules/
 .idea/
 .preview/

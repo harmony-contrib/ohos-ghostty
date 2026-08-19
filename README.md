@@ -64,6 +64,20 @@ Useful flags:
 
 The first `zig build` fetches git archives and compiles wgpu-native (Rust/cargo) plus libghostty-vt. Later builds reuse the cache.
 
+### Package the HAR
+
+Install `ohpm-rs`, configure `OHOS_NDK_HOME`, then run:
+
+```bash
+./scripts/pack-ohpm.sh
+```
+
+The script builds and verifies `libterminal.so` for `arm64-v8a`,
+`armeabi-v7a`, and `x86_64` before invoking `ohpm-rs prepublish` and
+`ohpm-rs pack`. The resulting HAR is written to `dist/`. `package/README.md`
+and `package/LICENSE` are relative symlinks to their repository-root files so
+the published package always carries the canonical documentation and license.
+
 ## Runtime architecture
 
 The terminal follows the same ownership split used by gpui-ghostty and
