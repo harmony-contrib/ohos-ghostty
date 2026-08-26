@@ -6,10 +6,18 @@ const ghostty = @import("ghostty.zig");
 pub const Snapshot = struct {
     cols: u16,
     rows: u16,
+    full_update: bool,
+    dirty_rows: []u16,
     cells: []font.Cell,
     cursor: ?font.CursorCell,
     cursor_color: config.Rgb,
     background: config.Rgb,
+
+    pub fn deinit(self: *Snapshot, allocator: std.mem.Allocator) void {
+        if (self.cells.len != 0) allocator.free(self.cells);
+        if (self.dirty_rows.len != 0) allocator.free(self.dirty_rows);
+        self.* = undefined;
+    }
 };
 
 pub const Cache = struct {
@@ -127,6 +135,9 @@ fn captureInternal(
     var read_start: u16 = 0;
     var read_end: u16 = rows;
     var read_dirty_rows = false;
+    var full_update = maybe_cache == null;
+    var dirty_rows: std.ArrayList(u16) = .empty;
+    defer dirty_rows.deinit(allocator);
 
     if (maybe_cache) |cache| {
         if (!cache.ensureSize(cols, rows)) return null;
@@ -134,8 +145,11 @@ fn captureInternal(
         const reusable = cache.initialized and
             cache.cols == cols and
             cache.rows == rows;
-        if (reusable) switch (update_hint) {
-            .full => switch (dirty) {
+        if (!reusable) {
+            full_update = true;
+        } else switch (update_hint) {
+            .full => full_update = true,
+            .terminal => switch (dirty) {
                 .clean => {
                     read_start = 0;
                     read_end = 0;
@@ -145,11 +159,15 @@ fn captureInternal(
                     read_end = 0;
                     read_dirty_rows = true;
                 },
-                else => {},
+                else => full_update = true,
             },
-            .cursor => if (cache.viewport_offset == viewport_offset) {
-                read_start = 0;
-                read_end = 0;
+            .cursor => {
+                if (cache.viewport_offset == viewport_offset) {
+                    read_start = 0;
+                    read_end = 0;
+                } else {
+                    full_update = true;
+                }
             },
             .viewport => {
                 const delta = viewportDelta(cache.viewport_offset, viewport_offset);
@@ -158,6 +176,7 @@ fn captureInternal(
                     read_start = 0;
                     read_end = 0;
                 } else if (amount < rows) {
+                    full_update = true;
                     shiftCachedRows(target, cols, rows, delta);
                     const moved: u16 = @intCast(amount);
                     if (delta > 0) {
@@ -167,9 +186,11 @@ fn captureInternal(
                         read_start = 0;
                         read_end = moved;
                     }
+                } else {
+                    full_update = true;
                 }
             },
-        };
+        }
     } else {
         target = allocator.alloc(font.Cell, @as(usize, cols) * @as(usize, rows)) catch return null;
         owned_cells = target;
@@ -184,6 +205,7 @@ fn captureInternal(
         default_fg,
         default_bg,
         &palette,
+        &dirty_rows,
     )) {
         if (owned_cells) |cells| allocator.free(cells);
         return null;
@@ -210,22 +232,48 @@ fn captureInternal(
         }
     }
 
-    const result_cells = if (maybe_cache) |cache| blk: {
+    var result_cells: []font.Cell = &.{};
+    var result_dirty_rows: []u16 = &.{};
+    if (full_update) {
+        result_cells = if (maybe_cache) |cache| blk: {
+            break :blk allocator.dupe(font.Cell, cache.cells) catch return null;
+        } else owned_cells.?;
+        owned_cells = null;
+    } else if (dirty_rows.items.len != 0) {
+        const count = std.math.mul(usize, dirty_rows.items.len, cols) catch return null;
+        result_cells = allocator.alloc(font.Cell, count) catch return null;
+        for (dirty_rows.items, 0..) |row, index| {
+            const source = @as(usize, row) * @as(usize, cols);
+            const destination = index * @as(usize, cols);
+            @memcpy(
+                result_cells[destination .. destination + cols],
+                target[source .. source + cols],
+            );
+        }
+        result_dirty_rows = dirty_rows.toOwnedSlice(allocator) catch {
+            allocator.free(result_cells);
+            return null;
+        };
+    }
+
+    if (maybe_cache) |cache| {
         cache.cols = cols;
         cache.rows = rows;
         cache.viewport_offset = viewport_offset;
         cache.initialized = true;
-        break :blk allocator.dupe(font.Cell, target) catch return null;
-    } else owned_cells.?;
+    }
 
     if (ghostty.ghostty_render_state_clean(render_state) != .success) {
-        allocator.free(result_cells);
+        if (result_cells.len != 0) allocator.free(result_cells);
+        if (result_dirty_rows.len != 0) allocator.free(result_dirty_rows);
         return null;
     }
 
     return .{
         .cols = cols,
         .rows = rows,
+        .full_update = full_update,
+        .dirty_rows = result_dirty_rows,
         .cells = result_cells,
         .cursor = cursor,
         .cursor_color = cursor_color,
@@ -242,6 +290,7 @@ fn readDirtyRows(
     default_fg: config.Rgb,
     default_bg: config.Rgb,
     palette: *const [256]ghostty.ColorRgb,
+    dirty_rows: *std.ArrayList(u16),
 ) bool {
     var iterator: ?*ghostty.RowIterator = null;
     if (ghostty.ghostty_render_state_row_iterator_new(null, &iterator) != .success) return false;
@@ -257,6 +306,7 @@ fn readDirtyRows(
     var row: u16 = 0;
     while (ghostty.ghostty_render_state_row_iterator_next_dirty(iterator, &row)) {
         if (row >= rows) return false;
+        dirty_rows.append(allocator, row) catch return false;
         const first = @as(usize, row) * @as(usize, cols);
         @memset(target[first .. first + cols], .{ .fg = default_fg, .bg = default_bg });
         if (ghostty.ghostty_render_state_row_get(iterator, .cells, @ptrCast(&cells_handle)) != .success) {

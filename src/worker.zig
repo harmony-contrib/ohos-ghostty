@@ -1,7 +1,5 @@
 const std = @import("std");
 
-const config = @import("config.zig");
-const font = @import("font.zig");
 const hilog = @import("hilog");
 const native_vsync = @import("native_vsync");
 const native_window = @import("native_window");
@@ -12,25 +10,8 @@ const vsync_min_fps: i32 = 30;
 const vsync_max_fps: i32 = 120;
 const vsync_expected_fps: i32 = 120;
 
-pub const FrameSink = *const fn (context: ?*anyopaque, timestamp: u64) void;
-
-pub const PaintPacket = struct {
-    allocator: std.mem.Allocator,
-    cols: u16,
-    rows: u16,
-    cell_width: u32,
-    cell_height: u32,
-    padding: u32,
-    cells: []font.Cell,
-    cursor: ?font.CursorCell,
-    cursor_color: config.Rgb,
-    background: config.Rgb,
-
-    fn deinit(self: *PaintPacket) void {
-        self.allocator.free(self.cells);
-        self.* = undefined;
-    }
-};
+pub const FrameSink = *const fn (context: ?*anyopaque, timestamp: u64) bool;
+pub const PaintPacket = @import("paint_packet.zig").PaintPacket;
 
 const SurfaceMsg = struct {
     window: native_window.NativeWindow,
@@ -70,6 +51,7 @@ pub const WorkerHandle = struct {
     queue: std.ArrayList(Message) = .empty,
     latest: ?PaintPacket = null,
     render_pending: std.atomic.Value(bool) = .init(false),
+    fallback_timestamp: std.atomic.Value(u64) = .init(0),
     vsync_live: std.atomic.Value(bool) = .init(false),
     vsync_generation: std.atomic.Value(u64) = .init(0),
     ready: std.atomic.Value(bool) = .init(false),
@@ -158,14 +140,23 @@ pub const WorkerHandle = struct {
     }
 
     pub fn publish(self: *WorkerHandle, packet: PaintPacket) void {
+        var next = packet;
         self.lock();
-        if (self.latest) |*previous| previous.deinit();
-        self.latest = packet;
+        if (self.latest) |*previous| {
+            if (!previous.mergeFrom(&next)) {
+                previous.deinit();
+                previous.* = next;
+            }
+        } else {
+            self.latest = next;
+        }
         self.unlock();
-        if (!self.isVsyncLive()) self.scheduleRender();
+        if (!self.isVsyncLive()) self.requestFrame(0);
     }
 
-    fn scheduleRender(self: *WorkerHandle) void {
+    pub fn requestFrame(self: *WorkerHandle, timestamp: u64) void {
+        if (timestamp != 0) self.fallback_timestamp.store(timestamp, .release);
+        if (self.isVsyncLive()) return;
         if (self.render_pending.cmpxchgStrong(false, true, .acq_rel, .acquire) == null) {
             if (!self.push(.render)) self.render_pending.store(false, .release);
         }
@@ -203,12 +194,12 @@ pub const WorkerHandle = struct {
         return self.latest != null;
     }
 
-    fn invokeFrameSink(self: *WorkerHandle, timestamp: u64) void {
+    fn invokeFrameSink(self: *WorkerHandle, timestamp: u64) bool {
         self.lock();
         const callback = self.frame_sink;
         const context = self.frame_context;
         self.unlock();
-        if (callback) |sink| sink(context, timestamp);
+        return if (callback) |sink| sink(context, timestamp) else false;
     }
 
     fn setError(self: *WorkerHandle, name: []const u8) void {
@@ -260,9 +251,15 @@ fn run(self: *WorkerHandle) void {
                     window.deinit();
                     held_window = null;
                 }
+                if (current) |*packet| packet.deinit();
+                current = null;
+                current_dirty = false;
                 self.ready.store(false, .seq_cst);
             },
             .surface => |surface| {
+                if (self.takeLatest()) |packet| {
+                    mergeCurrent(&current, &current_dirty, packet);
+                }
                 if (renderer != null and held_window != null and
                     held_window.?.rawHandle() == surface.window.rawHandle())
                 {
@@ -316,6 +313,9 @@ fn run(self: *WorkerHandle) void {
                 if (present(self, &renderer, current)) current_dirty = false;
             },
             .resize => |size| {
+                if (self.takeLatest()) |packet| {
+                    mergeCurrent(&current, &current_dirty, packet);
+                }
                 const gpu = if (renderer) |*item| item else continue;
                 gpu.resize(size.width, size.height) catch |err| {
                     self.setError(@errorName(err));
@@ -327,11 +327,9 @@ fn run(self: *WorkerHandle) void {
             },
             .vsync => |frame| {
                 if (!acceptVsync(&vsync, frame.generation)) continue;
-                self.invokeFrameSink(frame.timestamp);
+                _ = self.invokeFrameSink(frame.timestamp);
                 if (self.takeLatest()) |packet| {
-                    if (current) |*previous| previous.deinit();
-                    current = packet;
-                    current_dirty = true;
+                    mergeCurrent(&current, &current_dirty, packet);
                 }
                 if (current_dirty and present(self, &renderer, current)) {
                     current_dirty = false;
@@ -339,19 +337,32 @@ fn run(self: *WorkerHandle) void {
                 requestNextVsync(self, &vsync);
             },
             .render => {
+                const more_work = self.invokeFrameSink(
+                    self.fallback_timestamp.swap(0, .acq_rel),
+                );
                 if (self.takeLatest()) |packet| {
-                    if (current) |*previous| previous.deinit();
-                    current = packet;
-                    current_dirty = true;
+                    mergeCurrent(&current, &current_dirty, packet);
                 }
                 if (!self.isVsyncLive() and current_dirty and present(self, &renderer, current)) {
                     current_dirty = false;
                 }
                 self.render_pending.store(false, .release);
-                if (!self.isVsyncLive() and self.hasLatest()) self.scheduleRender();
+                if (!self.isVsyncLive() and (more_work or self.hasLatest())) {
+                    self.requestFrame(0);
+                }
             },
         }
     }
+}
+
+fn mergeCurrent(current: *?PaintPacket, dirty: *bool, packet: PaintPacket) void {
+    var next = packet;
+    if (current.*) |*previous| {
+        if (dirty.* and previous.mergeFrom(&next)) return;
+        previous.deinit();
+    }
+    current.* = next;
+    dirty.* = true;
 }
 
 fn bindVsync(
@@ -408,7 +419,7 @@ fn requestNextVsync(self: *WorkerHandle, connection: *?WindowVsync) void {
     item.handle.requestFrame(onNativeFrame, self) catch |err| {
         hilog.errorf("terminal worker failed to request VSync frame: {s}", .{@errorName(err)});
         stopVsync(self, connection);
-        self.scheduleRender();
+        self.requestFrame(0);
         return;
     };
     item.requested = true;
@@ -425,7 +436,7 @@ fn onNativeFrame(timestamp: i64, context: ?*anyopaque) void {
         .timestamp = resolved_timestamp,
     } })) {
         self.vsync_live.store(false, .release);
-        self.scheduleRender();
+        self.requestFrame(0);
     }
 }
 
@@ -435,6 +446,8 @@ fn present(self: *WorkerHandle, renderer: *?renderer_mod.Renderer, packet: ?Pain
     gpu.present(
         frame.cols,
         frame.rows,
+        frame.full_update,
+        frame.dirty_rows,
         @max(frame.cell_width, 1),
         @max(frame.cell_height, 1),
         frame.padding,

@@ -114,6 +114,57 @@ test "official Ghostty render state exposes complete cell styling" {
     try std.testing.expect(frame.cells[1].invisible);
 }
 
+test "cached capture transfers only Ghostty dirty rows" {
+    const terminal = try createTerminal(12, 4, 16);
+    defer ghostty.ghostty_terminal_free(terminal);
+    const state = try ghostty.createRenderState();
+    defer ghostty.ghostty_render_state_free(state);
+    var cache = capture.Cache.init(std.testing.allocator);
+    defer cache.deinit();
+
+    var initial = capture.captureCached(
+        &cache,
+        std.testing.allocator,
+        terminal,
+        state,
+        true,
+        .full,
+    ) orelse return error.CaptureFailed;
+    defer initial.deinit(std.testing.allocator);
+    try std.testing.expect(initial.full_update);
+    try std.testing.expectEqual(@as(usize, 48), initial.cells.len);
+    try std.testing.expectEqual(@as(usize, 0), initial.dirty_rows.len);
+
+    ghostty.write(terminal, "A");
+    var delta = capture.captureCached(
+        &cache,
+        std.testing.allocator,
+        terminal,
+        state,
+        true,
+        .terminal,
+    ) orelse return error.CaptureFailed;
+    defer delta.deinit(std.testing.allocator);
+    try std.testing.expect(!delta.full_update);
+    try std.testing.expectEqual(@as(usize, 1), delta.dirty_rows.len);
+    try std.testing.expectEqual(@as(u16, 0), delta.dirty_rows[0]);
+    try std.testing.expectEqual(@as(usize, 12), delta.cells.len);
+    try std.testing.expectEqual(@as(u32, 'A'), delta.cells[0].codepoint);
+
+    var cursor_only = capture.captureCached(
+        &cache,
+        std.testing.allocator,
+        terminal,
+        state,
+        false,
+        .cursor,
+    ) orelse return error.CaptureFailed;
+    defer cursor_only.deinit(std.testing.allocator);
+    try std.testing.expect(!cursor_only.full_update);
+    try std.testing.expectEqual(@as(usize, 0), cursor_only.dirty_rows.len);
+    try std.testing.expectEqual(@as(usize, 0), cursor_only.cells.len);
+}
+
 test "official Ghostty key encoder follows active terminal modes" {
     const terminal = try createTerminal(8, 2, 8);
     defer ghostty.ghostty_terminal_free(terminal);

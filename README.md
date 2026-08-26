@@ -95,17 +95,22 @@ arkit_terminal:
    to the app through `on_input`; only host output is fed back to Ghostty.
    Hardware keys are encoded by Ghostty's own `GhosttyKeyEncoder`, synchronized
    from current terminal modes rather than a local escape-sequence table.
-2. A chunked output worker owns libghostty-vt mutation and captures immutable
-   viewport snapshots. `feed()` only enqueues bytes, so large PTY bursts never
-   parse on ArkUI. Surface size and font density determine rows and columns;
-   the grid is reflowed instead of stretching glyphs to preserve a fixed size.
+2. The render worker owns hot-path libghostty-vt stream mutation and captures
+   immutable viewport updates. `feed()` only enqueues bytes, so large PTY bursts never
+   parse on ArkUI. Parsing is chunked and coalesced to display ticks; Ghostty's
+   terminal and per-row dirty state is retained instead of copying the full
+   viewport for each PTY chunk. Surface size and font density determine rows
+   and columns; the grid is reflowed instead of stretching glyphs.
 3. The render worker exclusively owns wgpu, the retained `OHNativeWindow`, and
    a window-associated `OH_NativeVSync`. It keeps one one-shot frame request in
    flight and presents only the newest snapshot on that surface's display tick.
    Distinct graphemes are rasterized once into a
    persistent GPU atlas; backgrounds, cached glyph quads, and the cursor are
    submitted as GPU instances. There is no CPU-composited fullscreen bitmap.
-   Frame publication is latest-wins so slow frames cannot replay stale states.
+   CPU-side GPU cell lists retain one allocation per row, matching Ghostty's
+   `renderer.cell.Contents`: only dirty rows are rebuilt, while the resulting
+   buffers are batch-uploaded and drawn by wgpu. Frame publication merges
+   unconsumed dirty rows so slow frames cannot drop or replay stale states.
 4. Renderer readiness means that a frame was successfully presented, not just
    that a device was created. Surface loss and validation errors remain visible
    through the ArkTS diagnostic overlay.
@@ -119,10 +124,10 @@ atomically and is applied on the next available frame, preventing engine-lock
 contention from blocking the ArkUI thread.
 
 Surface and input callbacks only retain native resources or enqueue work. The
-output worker performs VT parsing; an available frame tick applies pending
-viewport movement and cursor timing. Both paths share the terminal-state lock,
-while the render worker consumes immutable snapshots and never reads mutable
-Ghostty state.
+render worker serializes VT parsing, pending viewport movement, cursor timing,
+dirty-row capture, GPU cell-list rebuild, and presentation. Configuration and
+query APIs briefly share the terminal-state lock but never mutate renderer GPU
+state.
 
 As in official Ghostty, font discovery and a glyph's first rasterization are
 CPU/font-system operations. Once cached, terminal frame

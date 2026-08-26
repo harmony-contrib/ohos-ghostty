@@ -25,12 +25,9 @@ pub const Session = struct {
     worker: *worker_mod.WorkerHandle,
     engine_mutex: std.Io.Mutex = .init,
     output_mutex: std.Io.Mutex = .init,
-    output_condition: std.Io.Condition = .init,
     pending_output: std.ArrayList(u8) = .empty,
     pending_keys: std.ArrayList(input.KeyInput) = .empty,
     key_mod_state: input.ModState = .{},
-    output_running: std.atomic.Value(bool) = .init(true),
-    output_thread: ?std.Thread = null,
     width: u32 = 0,
     height: u32 = 0,
     density: f64 = 1,
@@ -75,17 +72,13 @@ pub const Session = struct {
         session.worker.setFrameSink(onWorkerFrame, session);
         session.applyConfig();
         ghostty.write(session.terminal, "\x1b[?25h");
-        session.output_thread = std.Thread.spawn(.{}, outputRun, .{session}) catch |err| {
-            session.destroy();
-            return err;
-        };
         return session;
     }
 
     pub fn destroy(self: *Session) void {
-        self.shutdownOutput();
         ime.shutdown();
         self.worker.shutdown();
+        self.deinitPendingWork();
         ghostty.ghostty_render_state_row_cells_free(self.row_cells);
         ghostty.ghostty_render_state_row_iterator_free(self.row_iterator);
         ghostty.freeKeyEvent(self.key_event);
@@ -117,23 +110,23 @@ pub const Session = struct {
             hilog.errorf("failed to configure terminal surface: {s}", .{@errorName(err)});
             return;
         };
-        self.worker.sendSurface(window, surface_id, width, height);
         self.lockEngine();
-        defer self.unlockEngine();
         self.width = width;
         self.height = height;
         self.reflowGrid();
         self.publishFullFrameLocked();
+        self.unlockEngine();
+        self.worker.sendSurface(window, surface_id, width, height);
     }
 
     pub fn updateSurface(self: *Session, width: u32, height: u32) void {
         self.lockEngine();
-        defer self.unlockEngine();
         self.width = width;
         self.height = height;
-        self.worker.resizeSurface(width, height);
         self.reflowGrid();
         self.publishFullFrameLocked();
+        self.unlockEngine();
+        self.worker.resizeSurface(width, height);
     }
 
     pub fn detachSurface(self: *Session) void {
@@ -159,14 +152,15 @@ pub const Session = struct {
     }
 
     pub fn feedOutput(self: *Session, bytes: []const u8) void {
-        if (bytes.len == 0 or !self.output_running.load(.acquire)) return;
+        if (bytes.len == 0) return;
         self.lockOutput();
-        defer self.unlockOutput();
         self.pending_output.appendSlice(self.allocator, bytes) catch {
+            self.unlockOutput();
             hilog.errorf("terminal output queue allocation failed", .{});
             return;
         };
-        self.output_condition.signal(std.Options.debug_io);
+        self.unlockOutput();
+        self.worker.requestFrame(0);
     }
 
     pub fn writeInput(self: *Session, bytes: []const u8) void {
@@ -176,12 +170,13 @@ pub const Session = struct {
     pub fn handleKey(self: *Session, event: xcomponent.KeyEventData) void {
         const pending = self.key_mod_state.translate(event) orelse return;
         self.lockOutput();
-        defer self.unlockOutput();
         self.pending_keys.append(self.allocator, pending) catch {
+            self.unlockOutput();
             hilog.errorf("terminal key queue allocation failed", .{});
             return;
         };
-        self.output_condition.signal(std.Options.debug_io);
+        self.unlockOutput();
+        self.worker.requestFrame(0);
     }
 
     pub fn handleTouch(self: *Session, event: xcomponent.TouchEventData) void {
@@ -229,18 +224,46 @@ pub const Session = struct {
         }
     }
 
-    pub fn renderFrame(self: *Session, timestamp: u64) void {
-        if (!self.tryLockEngine()) return;
+    pub fn renderFrame(self: *Session, timestamp: u64) bool {
+        if (!self.tryLockEngine()) return true;
         defer self.unlockEngine();
+        var terminal_changed = false;
+        var chunk: [output_chunk_size]u8 = undefined;
+        if (self.takeOutput(&chunk)) |len| {
+            ghostty.write(self.terminal, chunk[0..len]);
+            self.cursor_phase = true;
+            self.last_blink_timestamp = null;
+            terminal_changed = true;
+        }
+        if (self.takeKey()) |key| {
+            var encoded_storage: [256]u8 = undefined;
+            const encoded = ghostty.encodeKey(
+                self.key_encoder,
+                self.key_event,
+                self.terminal,
+                key.action,
+                key.key,
+                key.mods,
+                key.utf8(),
+                key.unshifted_codepoint,
+                &encoded_storage,
+            ) catch |err| {
+                hilog.errorf("terminal key encoding failed: {s}", .{@errorName(err)});
+                return self.hasPendingWork();
+            };
+            self.pending_input.append(encoded);
+        }
+        var viewport_changed = false;
+        var cursor_changed = false;
         if (self.pending_reset_scroll.swap(false, .acq_rel)) {
             _ = self.pending_scroll.swap(0, .acq_rel);
             ghostty.scrollBottom(self.terminal);
-            self.publishViewportFrameLocked();
+            viewport_changed = true;
         } else {
             const scroll = self.pending_scroll.swap(0, .acq_rel);
             if (scroll != 0) {
                 ghostty.scrollDelta(self.terminal, scroll);
-                self.publishViewportFrameLocked();
+                viewport_changed = true;
             }
         }
         if (self.terminal_config.cursorBlink) {
@@ -251,7 +274,7 @@ pub const Session = struct {
                     const phases = elapsed / blink_ns;
                     if (phases % 2 == 1) self.cursor_phase = !self.cursor_phase;
                     self.last_blink_timestamp = previous + phases * blink_ns;
-                    self.publishCursorFrameLocked();
+                    cursor_changed = true;
                 }
             } else {
                 self.last_blink_timestamp = timestamp;
@@ -260,9 +283,21 @@ pub const Session = struct {
             self.last_blink_timestamp = null;
             if (!self.cursor_phase) {
                 self.cursor_phase = true;
-                self.publishCursorFrameLocked();
+                cursor_changed = true;
             }
         }
+        const update_hint: ?config.UpdateHint = if (terminal_changed and viewport_changed)
+            .full
+        else if (viewport_changed)
+            .viewport
+        else if (terminal_changed)
+            .terminal
+        else if (cursor_changed)
+            .cursor
+        else
+            null;
+        if (update_hint) |hint| self.publishFrame(hint);
+        return self.hasPendingWork();
     }
 
     pub fn scrollView(self: *Session, delta: i32) void {
@@ -291,14 +326,6 @@ pub const Session = struct {
         self.publishFrame(.full);
     }
 
-    fn publishViewportFrameLocked(self: *Session) void {
-        self.publishFrame(.viewport);
-    }
-
-    fn publishCursorFrameLocked(self: *Session) void {
-        self.publishFrame(.cursor);
-    }
-
     fn publishFrame(self: *Session, update_hint: config.UpdateHint) void {
         const snapshot = capture_mod.captureCached(
             &self.capture_cache,
@@ -312,6 +339,8 @@ pub const Session = struct {
             .allocator = std.heap.c_allocator,
             .cols = snapshot.cols,
             .rows = snapshot.rows,
+            .full_update = snapshot.full_update,
+            .dirty_rows = snapshot.dirty_rows,
             .cell_width = @intFromFloat(@max(self.cell_metrics.width, 1)),
             .cell_height = @intFromFloat(@max(self.cell_metrics.height, 1)),
             .padding = self.padding_px,
@@ -463,38 +492,16 @@ pub const Session = struct {
         }
     }
 
-    fn shutdownOutput(self: *Session) void {
-        self.output_running.store(false, .release);
-        self.lockOutput();
-        self.output_condition.broadcast(std.Options.debug_io);
-        self.unlockOutput();
-        if (self.output_thread) |thread| {
-            thread.join();
-            self.output_thread = null;
-        }
+    fn deinitPendingWork(self: *Session) void {
         self.lockOutput();
         self.pending_output.deinit(self.allocator);
         self.pending_keys.deinit(self.allocator);
         self.unlockOutput();
     }
 
-    const Work = union(enum) {
-        output: usize,
-        key: input.KeyInput,
-    };
-
-    fn takeWork(self: *Session, destination: []u8) ?Work {
+    fn takeOutput(self: *Session, destination: []u8) ?usize {
         self.lockOutput();
         defer self.unlockOutput();
-        while (self.pending_output.items.len == 0 and
-            self.pending_keys.items.len == 0 and
-            self.output_running.load(.acquire))
-        {
-            self.output_condition.waitUncancelable(std.Options.debug_io, &self.output_mutex);
-        }
-        if (self.pending_keys.items.len != 0) {
-            return .{ .key = self.pending_keys.orderedRemove(0) };
-        }
         if (self.pending_output.items.len == 0) return null;
         const count = @min(destination.len, self.pending_output.items.len);
         @memcpy(destination[0..count], self.pending_output.items[0..count]);
@@ -505,7 +512,20 @@ pub const Session = struct {
             self.pending_output.items[count..],
         );
         self.pending_output.shrinkRetainingCapacity(remaining);
-        return .{ .output = count };
+        return count;
+    }
+
+    fn takeKey(self: *Session) ?input.KeyInput {
+        self.lockOutput();
+        defer self.unlockOutput();
+        if (self.pending_keys.items.len == 0) return null;
+        return self.pending_keys.orderedRemove(0);
+    }
+
+    fn hasPendingWork(self: *Session) bool {
+        self.lockOutput();
+        defer self.unlockOutput();
+        return self.pending_output.items.len != 0 or self.pending_keys.items.len != 0;
     }
 
     fn lockEngine(self: *Session) void {
@@ -529,47 +549,9 @@ pub const Session = struct {
     }
 };
 
-fn onWorkerFrame(context: ?*anyopaque, timestamp: u64) void {
-    const session: *Session = @ptrCast(@alignCast(context orelse return));
-    session.renderFrame(timestamp);
-}
-
-fn outputRun(session: *Session) void {
-    var chunk: [output_chunk_size]u8 = undefined;
-    while (session.takeWork(&chunk)) |work| {
-        switch (work) {
-            .output => |len| {
-                session.lockEngine();
-                ghostty.write(session.terminal, chunk[0..len]);
-                session.cursor_phase = true;
-                session.last_blink_timestamp = null;
-                session.publishFullFrameLocked();
-                session.unlockEngine();
-            },
-            .key => |key| {
-                var encoded_storage: [256]u8 = undefined;
-                session.lockEngine();
-                const encoded = ghostty.encodeKey(
-                    session.key_encoder,
-                    session.key_event,
-                    session.terminal,
-                    key.action,
-                    key.key,
-                    key.mods,
-                    key.utf8(),
-                    key.unshifted_codepoint,
-                    &encoded_storage,
-                ) catch |err| {
-                    session.unlockEngine();
-                    hilog.errorf("terminal key encoding failed: {s}", .{@errorName(err)});
-                    continue;
-                };
-                session.pending_input.append(encoded);
-                session.unlockEngine();
-            },
-        }
-        std.Thread.yield() catch {};
-    }
+fn onWorkerFrame(context: ?*anyopaque, timestamp: u64) bool {
+    const session: *Session = @ptrCast(@alignCast(context orelse return false));
+    return session.renderFrame(timestamp);
 }
 
 fn writePty(

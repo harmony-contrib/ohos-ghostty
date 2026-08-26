@@ -23,7 +23,10 @@ pub const TerminalConfig = struct {
 };
 
 pub const UpdateHint = enum {
+    /// Rebuild every visible row. Used for geometry and configuration changes.
     full,
+    /// Consume Ghostty's terminal and per-row dirty state.
+    terminal,
     viewport,
     cursor,
 };

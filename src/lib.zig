@@ -99,7 +99,7 @@ fn onFrame(
     _: u64,
 ) void {
     if (currentSession()) |session| {
-        if (!session.worker.isVsyncLive()) session.renderFrame(timestamp);
+        if (!session.worker.isVsyncLive()) session.worker.requestFrame(timestamp);
     }
 }
 

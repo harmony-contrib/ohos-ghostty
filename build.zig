@@ -79,6 +79,13 @@ pub fn build(b: *std.Build) !void {
             .optimize = optimize,
         }),
     });
+    const paint_packet_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/paint_packet.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+        }),
+    });
     const ghostty_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/ghostty_test.zig"),
@@ -94,6 +101,7 @@ pub fn build(b: *std.Build) !void {
     test_step.dependOn(&b.addRunArtifact(font_tests).step);
     test_step.dependOn(&b.addRunArtifact(layout_tests).step);
     test_step.dependOn(&b.addRunArtifact(byte_queue_tests).step);
+    test_step.dependOn(&b.addRunArtifact(paint_packet_tests).step);
     test_step.dependOn(&b.addRunArtifact(ghostty_tests).step);
 }
 
