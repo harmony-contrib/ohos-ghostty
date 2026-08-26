@@ -3,9 +3,9 @@
 OpenHarmony terminal component that embeds [libghostty-vt](https://github.com/ghostty-org/ghostty) behind an `XComponent` surface.
 
 The native addon is built entirely by Zig. This workspace consumes the adjacent
-`../ohos-zig-binding` checkout for XComponent, Native Window, Native Drawing,
-and IME wrappers. Zig builds wgpu-native and the official libghostty-vt source;
-the HAR does not vendor prebuilt `.a` files.
+`../ohos-zig-binding` checkout for XComponent, Native Window, Native VSync,
+Native Drawing, and IME wrappers. Zig builds wgpu-native and the official
+libghostty-vt source; the HAR does not vendor prebuilt `.a` files.
 
 Terminal behavior is sourced from the pinned official Ghostty commit in
 `build.zig.zon`; the wrapper includes Ghostty's public headers and does not
@@ -27,7 +27,7 @@ example/ (entry HAP demo)
        └─ XComponent(libraryname = "terminal")
             └─ libterminal.so   zig build
                  ├─ zig-napi
-                 ├─ ohos-zig-binding (XComponent / window / drawing / IME)
+                 ├─ ohos-zig-binding (XComponent / window / VSync / drawing / IME)
                  ├─ raw-window-handle
                  ├─ wgpu-native-zig  (builds wgpu-native)
                  └─ ghostty          (builds libghostty-vt)
@@ -49,7 +49,9 @@ The demo page hosts `Terminal` and a cooked local shell (same host split as arki
 
 ## Build
 
-Requires Zig 0.16, an OpenHarmony NDK, and a network fetch of the git dependencies on the first build.
+Requires Zig 0.16, an OpenHarmony API 20+ NDK, the adjacent
+`ohos-zig-binding` checkout on branch `feat/native-vsync-binding`, and a network
+fetch of the remaining git dependencies on the first build.
 
 ```bash
 export OHOS_NDK_HOME=/path/to/ohos-sdk
@@ -98,7 +100,9 @@ arkit_terminal:
    parse on ArkUI. Surface size and font density determine rows and columns;
    the grid is reflowed instead of stretching glyphs to preserve a fixed size.
 3. The render worker exclusively owns wgpu, the retained `OHNativeWindow`, and
-   swapchain presentation. Distinct graphemes are rasterized once into a
+   a window-associated `OH_NativeVSync`. It keeps one one-shot frame request in
+   flight and presents only the newest snapshot on that surface's display tick.
+   Distinct graphemes are rasterized once into a
    persistent GPU atlas; backgrounds, cached glyph quads, and the cursor are
    submitted as GPU instances. There is no CPU-composited fullscreen bitmap.
    Frame publication is latest-wins so slow frames cannot replay stale states.
@@ -106,11 +110,13 @@ arkit_terminal:
    that a device was created. Surface loss and validation errors remain visible
    through the ArkTS diagnostic overlay.
 
-XComponent frame callbacks never wait for the terminal worker: if VT parsing is
-currently mutating the grid, that display tick is skipped and the latest
-immutable frame wins. Touch scrolling accumulates atomically and is applied on
-the next available frame, preventing engine-lock contention from blocking the
-ArkUI thread.
+Native VSync callbacks only enqueue a generation-tagged worker message. If a
+surface is replaced, late callbacks from its old VSync connection are ignored.
+If associated VSync creation fails, XComponent frame callbacks retain the
+previous fallback behavior. A busy terminal lock skips only that display tick,
+and the latest immutable frame still wins. Touch scrolling accumulates
+atomically and is applied on the next available frame, preventing engine-lock
+contention from blocking the ArkUI thread.
 
 Surface and input callbacks only retain native resources or enqueue work. The
 output worker performs VT parsing; an available frame tick applies pending
@@ -159,8 +165,8 @@ Declared in `build.zig.zon` and built by Zig:
 - `openharmony-zig/wgpu_native_zig`
 - `ghostty-org/ghostty` (`ghostty-vt-static` artifact)
 
-`ohos-zig-binding` is a local workspace dependency until the new
-`native_drawing` and `input_method` modules are published.
+`ohos-zig-binding` is a local workspace dependency until the new `native_vsync`
+module and `NativeWindow.surfaceId()` are published.
 
 ## LICENSE
 

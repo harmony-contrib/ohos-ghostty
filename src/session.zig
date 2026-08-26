@@ -72,6 +72,7 @@ pub const Session = struct {
         };
         ghostty.setUserdata(session.terminal, session) catch {};
         ghostty.setWritePty(session.terminal, writePty) catch {};
+        session.worker.setFrameSink(onWorkerFrame, session);
         session.applyConfig();
         ghostty.write(session.terminal, "\x1b[?25h");
         session.output_thread = std.Thread.spawn(.{}, outputRun, .{session}) catch |err| {
@@ -107,12 +108,16 @@ pub const Session = struct {
             hilog.errorf("failed to retain terminal surface: {s}", .{@errorName(err)});
             return;
         };
+        const surface_id = window.surfaceId() catch |err| surface_id: {
+            hilog.errorf("failed to resolve terminal surface ID: {s}", .{@errorName(err)});
+            break :surface_id null;
+        };
         window.setBufferGeometry(@intCast(@max(width, 1)), @intCast(@max(height, 1))) catch |err| {
             window.deinit();
             hilog.errorf("failed to configure terminal surface: {s}", .{@errorName(err)});
             return;
         };
-        self.worker.sendSurface(window, width, height);
+        self.worker.sendSurface(window, surface_id, width, height);
         self.lockEngine();
         defer self.unlockEngine();
         self.width = width;
@@ -523,6 +528,11 @@ pub const Session = struct {
         self.output_mutex.unlock(std.Options.debug_io);
     }
 };
+
+fn onWorkerFrame(context: ?*anyopaque, timestamp: u64) void {
+    const session: *Session = @ptrCast(@alignCast(context orelse return));
+    session.renderFrame(timestamp);
+}
 
 fn outputRun(session: *Session) void {
     var chunk: [output_chunk_size]u8 = undefined;

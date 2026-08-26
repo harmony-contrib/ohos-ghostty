@@ -35,7 +35,7 @@ fn imeSink(bytes: []const u8) void {
 
 fn enableFrameRate(component: xcomponent.XComponentRaw) void {
     const wrapper = xcomponent.NativeXComponent{ .component = component };
-    wrapper.setFrameRate(30, 120, 60) catch |err| {
+    wrapper.setFrameRate(30, 120, 120) catch |err| {
         hilog.errorf("failed to set XComponent frame rate: {s}", .{@errorName(err)});
     };
 }
@@ -98,7 +98,9 @@ fn onFrame(
     timestamp: u64,
     _: u64,
 ) void {
-    if (currentSession()) |session| session.renderFrame(timestamp);
+    if (currentSession()) |session| {
+        if (!session.worker.isVsyncLive()) session.renderFrame(timestamp);
+    }
 }
 
 fn onComponentError(

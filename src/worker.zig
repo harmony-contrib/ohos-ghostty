@@ -3,9 +3,16 @@ const std = @import("std");
 const config = @import("config.zig");
 const font = @import("font.zig");
 const hilog = @import("hilog");
+const native_vsync = @import("native_vsync");
 const native_window = @import("native_window");
 const renderer_mod = @import("renderer.zig");
 const window_mod = @import("window.zig");
+
+const vsync_min_fps: i32 = 30;
+const vsync_max_fps: i32 = 120;
+const vsync_expected_fps: i32 = 120;
+
+pub const FrameSink = *const fn (context: ?*anyopaque, timestamp: u64) void;
 
 pub const PaintPacket = struct {
     allocator: std.mem.Allocator,
@@ -27,6 +34,7 @@ pub const PaintPacket = struct {
 
 const SurfaceMsg = struct {
     window: native_window.NativeWindow,
+    surface_id: ?u64,
     width: u32,
     height: u32,
 };
@@ -36,9 +44,21 @@ const ResizeMsg = struct {
     height: u32,
 };
 
+const VsyncMsg = struct {
+    generation: u64,
+    timestamp: u64,
+};
+
+const WindowVsync = struct {
+    handle: native_vsync.NativeVSync,
+    generation: u64,
+    requested: bool,
+};
+
 const Message = union(enum) {
     surface: SurfaceMsg,
     resize: ResizeMsg,
+    vsync: VsyncMsg,
     lost,
     render,
 };
@@ -50,8 +70,12 @@ pub const WorkerHandle = struct {
     queue: std.ArrayList(Message) = .empty,
     latest: ?PaintPacket = null,
     render_pending: std.atomic.Value(bool) = .init(false),
+    vsync_live: std.atomic.Value(bool) = .init(false),
+    vsync_generation: std.atomic.Value(u64) = .init(0),
     ready: std.atomic.Value(bool) = .init(false),
     running: std.atomic.Value(bool) = .init(true),
+    frame_sink: ?FrameSink = null,
+    frame_context: ?*anyopaque = null,
     last_error: std.ArrayList(u8) = .empty,
     thread: ?std.Thread = null,
 
@@ -88,14 +112,40 @@ pub const WorkerHandle = struct {
         return self.ready.load(.seq_cst);
     }
 
+    pub fn isVsyncLive(self: *WorkerHandle) bool {
+        return self.vsync_live.load(.acquire);
+    }
+
+    pub fn setFrameSink(
+        self: *WorkerHandle,
+        callback: FrameSink,
+        context: ?*anyopaque,
+    ) void {
+        self.lock();
+        defer self.unlock();
+        self.frame_sink = callback;
+        self.frame_context = context;
+    }
+
     pub fn copyError(self: *WorkerHandle, allocator: std.mem.Allocator) []u8 {
         self.lock();
         defer self.unlock();
         return allocator.dupe(u8, self.last_error.items) catch allocator.alloc(u8, 0) catch &.{};
     }
 
-    pub fn sendSurface(self: *WorkerHandle, window: native_window.NativeWindow, width: u32, height: u32) void {
-        var message = Message{ .surface = .{ .window = window, .width = width, .height = height } };
+    pub fn sendSurface(
+        self: *WorkerHandle,
+        window: native_window.NativeWindow,
+        surface_id: ?u64,
+        width: u32,
+        height: u32,
+    ) void {
+        var message = Message{ .surface = .{
+            .window = window,
+            .surface_id = surface_id,
+            .width = width,
+            .height = height,
+        } };
         if (!self.push(message)) deinitMessage(&message);
     }
 
@@ -112,7 +162,7 @@ pub const WorkerHandle = struct {
         if (self.latest) |*previous| previous.deinit();
         self.latest = packet;
         self.unlock();
-        self.scheduleRender();
+        if (!self.isVsyncLive()) self.scheduleRender();
     }
 
     fn scheduleRender(self: *WorkerHandle) void {
@@ -153,6 +203,14 @@ pub const WorkerHandle = struct {
         return self.latest != null;
     }
 
+    fn invokeFrameSink(self: *WorkerHandle, timestamp: u64) void {
+        self.lock();
+        const callback = self.frame_sink;
+        const context = self.frame_context;
+        self.unlock();
+        if (callback) |sink| sink(context, timestamp);
+    }
+
     fn setError(self: *WorkerHandle, name: []const u8) void {
         self.lock();
         defer self.unlock();
@@ -178,8 +236,12 @@ pub const WorkerHandle = struct {
 fn run(self: *WorkerHandle) void {
     var renderer: ?renderer_mod.Renderer = null;
     var held_window: ?native_window.NativeWindow = null;
+    var vsync: ?WindowVsync = null;
+    var next_vsync_generation: u64 = 1;
     var current: ?PaintPacket = null;
+    var current_dirty = false;
     defer {
+        stopVsync(self, &vsync);
         if (renderer) |*item| item.deinit();
         if (held_window) |*window| window.deinit();
         if (current) |*packet| packet.deinit();
@@ -189,6 +251,7 @@ fn run(self: *WorkerHandle) void {
         const message = self.take() orelse break;
         switch (message) {
             .lost => {
+                stopVsync(self, &vsync);
                 if (renderer) |*item| {
                     item.deinit();
                     renderer = null;
@@ -211,9 +274,13 @@ fn run(self: *WorkerHandle) void {
                         hilog.errorf("terminal worker failed to resize surface: {s}", .{@errorName(err)});
                         continue;
                     };
-                    present(self, &renderer, current);
+                    if (vsync == null) {
+                        bindVsync(self, &vsync, &next_vsync_generation, surface.surface_id);
+                    }
+                    if (present(self, &renderer, current)) current_dirty = false;
                     continue;
                 }
+                stopVsync(self, &vsync);
                 if (renderer) |*item| {
                     item.deinit();
                     renderer = null;
@@ -243,9 +310,10 @@ fn run(self: *WorkerHandle) void {
                     continue;
                 };
                 held_window = surface.window;
+                bindVsync(self, &vsync, &next_vsync_generation, surface.surface_id);
                 self.ready.store(false, .release);
                 self.clearError();
-                present(self, &renderer, current);
+                if (present(self, &renderer, current)) current_dirty = false;
             },
             .resize => |size| {
                 const gpu = if (renderer) |*item| item else continue;
@@ -255,24 +323,115 @@ fn run(self: *WorkerHandle) void {
                     hilog.errorf("terminal worker failed to resize renderer: {s}", .{@errorName(err)});
                     continue;
                 };
-                present(self, &renderer, current);
+                if (present(self, &renderer, current)) current_dirty = false;
+            },
+            .vsync => |frame| {
+                if (!acceptVsync(&vsync, frame.generation)) continue;
+                self.invokeFrameSink(frame.timestamp);
+                if (self.takeLatest()) |packet| {
+                    if (current) |*previous| previous.deinit();
+                    current = packet;
+                    current_dirty = true;
+                }
+                if (current_dirty and present(self, &renderer, current)) {
+                    current_dirty = false;
+                }
+                requestNextVsync(self, &vsync);
             },
             .render => {
                 if (self.takeLatest()) |packet| {
                     if (current) |*previous| previous.deinit();
                     current = packet;
+                    current_dirty = true;
                 }
-                present(self, &renderer, current);
+                if (!self.isVsyncLive() and current_dirty and present(self, &renderer, current)) {
+                    current_dirty = false;
+                }
                 self.render_pending.store(false, .release);
-                if (self.hasLatest()) self.scheduleRender();
+                if (!self.isVsyncLive() and self.hasLatest()) self.scheduleRender();
             },
         }
     }
 }
 
-fn present(self: *WorkerHandle, renderer: *?renderer_mod.Renderer, packet: ?PaintPacket) void {
-    const gpu = if (renderer.*) |*item| item else return;
-    const frame = packet orelse return;
+fn bindVsync(
+    self: *WorkerHandle,
+    connection: *?WindowVsync,
+    next_generation: *u64,
+    surface_id: ?u64,
+) void {
+    stopVsync(self, connection);
+    const id = surface_id orelse return;
+    var handle = native_vsync.NativeVSync.createForAssociatedWindow(
+        std.heap.c_allocator,
+        id,
+        "ohos-terminal",
+    ) catch |err| {
+        hilog.errorf("terminal worker failed to create surface VSync: {s}", .{@errorName(err)});
+        return;
+    };
+    handle.setExpectedFrameRateRange(.{
+        .min = vsync_min_fps,
+        .max = vsync_max_fps,
+        .expected = vsync_expected_fps,
+    }) catch |err| {
+        hilog.errorf("terminal worker failed to set VSync frame rate: {s}", .{@errorName(err)});
+    };
+    const generation = next_generation.*;
+    next_generation.* +%= 1;
+    if (next_generation.* == 0) next_generation.* = 1;
+    self.vsync_generation.store(generation, .release);
+    connection.* = .{
+        .handle = handle,
+        .generation = generation,
+        .requested = false,
+    };
+    requestNextVsync(self, connection);
+}
+
+fn stopVsync(self: *WorkerHandle, connection: *?WindowVsync) void {
+    if (connection.*) |*item| item.handle.deinit();
+    connection.* = null;
+    self.vsync_live.store(false, .release);
+}
+
+fn acceptVsync(connection: *?WindowVsync, generation: u64) bool {
+    const item = if (connection.*) |*value| value else return false;
+    if (item.generation != generation) return false;
+    item.requested = false;
+    return true;
+}
+
+fn requestNextVsync(self: *WorkerHandle, connection: *?WindowVsync) void {
+    const item = if (connection.*) |*value| value else return;
+    if (item.requested) return;
+    item.handle.requestFrame(onNativeFrame, self) catch |err| {
+        hilog.errorf("terminal worker failed to request VSync frame: {s}", .{@errorName(err)});
+        stopVsync(self, connection);
+        self.scheduleRender();
+        return;
+    };
+    item.requested = true;
+    self.vsync_live.store(true, .release);
+}
+
+fn onNativeFrame(timestamp: i64, context: ?*anyopaque) void {
+    const self: *WorkerHandle = @ptrCast(@alignCast(context orelse return));
+    if (!self.running.load(.acquire)) return;
+    const resolved_timestamp: u64 = if (timestamp > 0) @intCast(timestamp) else 0;
+    const generation = self.vsync_generation.load(.acquire);
+    if (!self.push(.{ .vsync = .{
+        .generation = generation,
+        .timestamp = resolved_timestamp,
+    } })) {
+        self.vsync_live.store(false, .release);
+        self.scheduleRender();
+    }
+}
+
+fn present(self: *WorkerHandle, renderer: *?renderer_mod.Renderer, packet: ?PaintPacket) bool {
+    const gpu = if (renderer.*) |*item| item else return false;
+    const frame = packet orelse return false;
     gpu.present(
         frame.cols,
         frame.rows,
@@ -287,10 +446,11 @@ fn present(self: *WorkerHandle, renderer: *?renderer_mod.Renderer, packet: ?Pain
         self.setError(@errorName(err));
         self.ready.store(false, .release);
         hilog.errorf("terminal worker failed to present frame: {s}", .{@errorName(err)});
-        return;
+        return false;
     };
     self.clearError();
     self.ready.store(true, .release);
+    return true;
 }
 
 fn deinitMessage(message: *Message) void {
