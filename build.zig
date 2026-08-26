@@ -15,7 +15,7 @@ pub fn build(b: *std.Build) !void {
         "optimize",
         "Prioritize performance, safety, or binary size (defaults to ReleaseFast)",
     ) orelse .ReleaseFast;
-    const api = ohos_binding_build.apiOption(b) orelse ohos_binding_build.default_api;
+    const api = ohos_binding_build.apiOption(b) orelse 20;
 
     const zig_napi = b.dependency("zig-napi", .{});
     const napi = zig_napi.module("napi");
@@ -125,6 +125,7 @@ fn configureAddon(
     compile.root_module.addImport("xcomponent", ohos_binding.module("xcomponent"));
     compile.root_module.addImport("hilog", ohos_binding.module("hilog"));
     compile.root_module.addImport("native_window", ohos_binding.module("native_window"));
+    compile.root_module.addImport("native_vsync", ohos_binding.module("native_vsync"));
     compile.root_module.addImport("native_drawing", ohos_binding.module("native_drawing"));
     compile.root_module.addImport("input_method", ohos_binding.module("input_method"));
     compile.root_module.addImport("wgpu", wgpu);
