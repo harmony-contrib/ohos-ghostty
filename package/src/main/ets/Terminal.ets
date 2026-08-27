@@ -2,7 +2,7 @@ import { display } from '@kit.ArkUI';
 import { TerminalController } from './TerminalController';
 import { DEFAULT_TERMINAL_CONFIG } from './TerminalTypes';
 
-const NATIVE_LIBRARY = 'terminal';
+const NATIVE_LIBRARY = 'ghost_terminal';
 
 @Component
 export struct Terminal {

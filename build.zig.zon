@@ -9,7 +9,8 @@
             .hash = "zig_napi-0.1.0-H6Owa-yaCADSGSbJl4wKrcJyqJcTKrEQ19Aq_i_opHo3",
         },
         .ohos_zig_binding = .{
-            .path = "../ohos-zig-binding",
+            .url = "https://github.com/openharmony-zig/ohos-zig-binding/archive/f5890311475b7ffc1ed523560ee4fa277f2097aa.tar.gz",
+            .hash = "ohos_zig_binding-0.0.1-beta.0-Lo2pRBNuAgApl_6upMlf42yK-odzYjD-DwKZscnc-jod",
         },
         .raw_window_handle = .{
             .url = "https://github.com/openharmony-zig/raw-window-handle/archive/fff7811fb3097acab72500b1ad20a973ddccd376.tar.gz",

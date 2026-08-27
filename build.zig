@@ -29,7 +29,7 @@ pub fn build(b: *std.Build) !void {
 
     if (native) {
         const result = try napi_build.nativeAddonBuild(b, .{
-            .name = "terminal",
+            .name = "ghost_terminal",
             .root_module_options = .{
                 .root_source_file = b.path("src/lib.zig"),
                 .target = target,
@@ -43,16 +43,16 @@ pub fn build(b: *std.Build) !void {
 
         const dist = b.addUpdateSourceFiles();
         if (result.arm64) |arm64| {
-            dist.addCopyFileToSource(arm64.getEmittedBin(), "package/libs/arm64-v8a/libterminal.so");
-            dist.addCopyFileToSource(arm64.getEmittedBin(), "example/libs/arm64-v8a/libterminal.so");
+            dist.addCopyFileToSource(arm64.getEmittedBin(), "package/libs/arm64-v8a/libghost_terminal.so");
+            dist.addCopyFileToSource(arm64.getEmittedBin(), "example/libs/arm64-v8a/libghost_terminal.so");
         }
         if (result.arm) |arm| {
-            dist.addCopyFileToSource(arm.getEmittedBin(), "package/libs/armeabi-v7a/libterminal.so");
-            dist.addCopyFileToSource(arm.getEmittedBin(), "example/libs/armeabi-v7a/libterminal.so");
+            dist.addCopyFileToSource(arm.getEmittedBin(), "package/libs/armeabi-v7a/libghost_terminal.so");
+            dist.addCopyFileToSource(arm.getEmittedBin(), "example/libs/armeabi-v7a/libghost_terminal.so");
         }
         if (result.x64) |x64| {
-            dist.addCopyFileToSource(x64.getEmittedBin(), "package/libs/x86_64/libterminal.so");
-            dist.addCopyFileToSource(x64.getEmittedBin(), "example/libs/x86_64/libterminal.so");
+            dist.addCopyFileToSource(x64.getEmittedBin(), "package/libs/x86_64/libghost_terminal.so");
+            dist.addCopyFileToSource(x64.getEmittedBin(), "example/libs/x86_64/libghost_terminal.so");
         }
         const dist_step = b.step("dist", "Install the Zig-built addon into the HAR and example modules");
         dist_step.dependOn(&dist.step);

@@ -202,5 +202,5 @@ pub fn getRendererError() []u8 {
 }
 
 comptime {
-    napi.NODE_API_MODULE_WITH_INIT("terminal", @This(), init);
+    napi.NODE_API_MODULE_WITH_INIT("ghost_terminal", @This(), init);
 }
