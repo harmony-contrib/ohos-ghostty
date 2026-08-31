@@ -19,6 +19,7 @@ const RendererError = error{
     NoFont,
     InvalidSurfaceCapabilities,
     AtlasFull,
+    InvalidScene,
     OutOfMemory,
 };
 
@@ -47,6 +48,39 @@ const GlyphEntry = struct {
     offset_y: i32,
     width: u32,
     height: u32,
+};
+
+/// CPU-side cell contents mirroring Ghostty's `renderer.cell.Contents`.
+/// Rows retain allocation and only dirty rows are rebuilt before the complete
+/// row lists are synchronized to GPU buffers.
+const SceneRow = struct {
+    rect_before: std.ArrayList(RectInstance) = .empty,
+    rect_after: std.ArrayList(RectInstance) = .empty,
+    glyphs: std.ArrayList(GlyphInstance) = .empty,
+
+    fn init(allocator: std.mem.Allocator, cols: u16) RendererError!SceneRow {
+        var row: SceneRow = .{};
+        errdefer row.deinit(allocator);
+        row.rect_before.ensureTotalCapacity(allocator, @as(usize, cols) * 2) catch
+            return error.OutOfMemory;
+        row.rect_after.ensureTotalCapacity(allocator, @as(usize, cols) * 2) catch
+            return error.OutOfMemory;
+        row.glyphs.ensureTotalCapacity(allocator, cols) catch return error.OutOfMemory;
+        return row;
+    }
+
+    fn clear(self: *SceneRow) void {
+        self.rect_before.clearRetainingCapacity();
+        self.rect_after.clearRetainingCapacity();
+        self.glyphs.clearRetainingCapacity();
+    }
+
+    fn deinit(self: *SceneRow, allocator: std.mem.Allocator) void {
+        self.rect_before.deinit(allocator);
+        self.rect_after.deinit(allocator);
+        self.glyphs.deinit(allocator);
+        self.* = .{};
+    }
 };
 
 const PipelineBundle = struct {
@@ -87,6 +121,19 @@ pub const Renderer = struct {
     atlas_cursor_y: u32 = 0,
     atlas_row_height: u32 = 0,
     glyph_entries: std.ArrayList(GlyphEntry) = .empty,
+    cell_cache: []font.Cell = &.{},
+    scene_rows: []SceneRow = &.{},
+    dirty_rows: []bool = &.{},
+    scene_cols: u16 = 0,
+    scene_row_count: u16 = 0,
+    scene_cell_width: u32 = 0,
+    scene_cell_height: u32 = 0,
+    scene_padding: u32 = 0,
+    scene_cursor: ?font.CursorCell = null,
+    scene_cursor_color: config.Rgb = .{},
+    scene_clear: config.Rgb = .{},
+    scene_invalid: bool = true,
+    cursor_rects: std.ArrayList(RectInstance) = .empty,
     rect_before: std.ArrayList(RectInstance) = .empty,
     rect_after: std.ArrayList(RectInstance) = .empty,
     rect_instances: std.ArrayList(RectInstance) = .empty,
@@ -205,6 +252,11 @@ pub const Renderer = struct {
         if (self.rasterizer) |*item| item.deinit();
         self.rasterizer = null;
         self.glyph_entries.deinit(self.allocator);
+        if (self.cell_cache.len != 0) self.allocator.free(self.cell_cache);
+        for (self.scene_rows) |*row| row.deinit(self.allocator);
+        if (self.scene_rows.len != 0) self.allocator.free(self.scene_rows);
+        if (self.dirty_rows.len != 0) self.allocator.free(self.dirty_rows);
+        self.cursor_rects.deinit(self.allocator);
         self.rect_before.deinit(self.allocator);
         self.rect_after.deinit(self.allocator);
         self.rect_instances.deinit(self.allocator);
@@ -228,6 +280,7 @@ pub const Renderer = struct {
     pub fn resize(self: *Renderer, width: u32, height: u32) RendererError!void {
         self.width = @max(width, 1);
         self.height = @max(height, 1);
+        self.scene_invalid = true;
         self.configureSurface();
     }
 
@@ -235,6 +288,8 @@ pub const Renderer = struct {
         self: *Renderer,
         cols: u16,
         rows: u16,
+        full_update: bool,
+        dirty_rows: []const u16,
         cell_width: u32,
         cell_height: u32,
         padding: u32,
@@ -246,9 +301,11 @@ pub const Renderer = struct {
         const resolved_cell_width = @max(cell_width, 1);
         const resolved_cell_height = @max(cell_height, 1);
         try self.ensureRasterizer(resolved_cell_width, resolved_cell_height);
-        self.buildScene(
+        self.updateScene(
             cols,
             rows,
+            full_update,
+            dirty_rows,
             resolved_cell_width,
             resolved_cell_height,
             padding,
@@ -259,9 +316,12 @@ pub const Renderer = struct {
         ) catch |err| {
             if (err != error.AtlasFull) return err;
             try self.growAtlas();
-            try self.buildScene(
+            self.scene_invalid = true;
+            try self.updateScene(
                 cols,
                 rows,
+                full_update,
+                dirty_rows,
                 resolved_cell_width,
                 resolved_cell_height,
                 padding,
@@ -371,12 +431,15 @@ pub const Renderer = struct {
         self.atlas_cursor_y = 0;
         self.atlas_row_height = 0;
         self.glyph_entries.clearRetainingCapacity();
+        self.scene_invalid = true;
     }
 
-    fn buildScene(
+    fn updateScene(
         self: *Renderer,
         cols: u16,
         rows: u16,
+        full_update: bool,
+        updated_rows: []const u16,
         cell_width: u32,
         cell_height: u32,
         padding: u32,
@@ -385,54 +448,154 @@ pub const Renderer = struct {
         cursor_color: config.Rgb,
         clear: config.Rgb,
     ) RendererError!void {
-        self.rect_before.clearRetainingCapacity();
-        self.rect_after.clearRetainingCapacity();
-        self.rect_instances.clearRetainingCapacity();
-        self.glyph_instances.clearRetainingCapacity();
+        const grid_changed = self.scene_cols != cols or self.scene_row_count != rows;
+        if (grid_changed) try self.resizeScene(cols, rows);
+
+        const cell_count = std.math.mul(usize, cols, rows) catch return error.InvalidScene;
+        if (full_update) {
+            if (cells.len != cell_count) return error.InvalidScene;
+            @memcpy(self.cell_cache, cells);
+        } else if (updated_rows.len != 0) {
+            const update_count = std.math.mul(usize, updated_rows.len, cols) catch
+                return error.InvalidScene;
+            if (cells.len != update_count) return error.InvalidScene;
+            for (updated_rows, 0..) |row, index| {
+                if (row >= rows) return error.InvalidScene;
+                const destination = @as(usize, row) * @as(usize, cols);
+                const source = index * @as(usize, cols);
+                @memcpy(
+                    self.cell_cache[destination .. destination + cols],
+                    cells[source .. source + cols],
+                );
+            }
+        } else if (cells.len != 0) {
+            return error.InvalidScene;
+        }
+
+        @memset(self.dirty_rows, false);
+        const geometry_changed = self.scene_invalid or
+            self.scene_cell_width != cell_width or
+            self.scene_cell_height != cell_height or
+            self.scene_padding != padding or
+            !std.meta.eql(self.scene_clear, clear);
+        if (geometry_changed or full_update or grid_changed) {
+            @memset(self.dirty_rows, true);
+        } else {
+            for (updated_rows) |row| self.dirty_rows[row] = true;
+        }
+
+        const cursor_changed = !std.meta.eql(self.scene_cursor, cursor) or
+            !std.meta.eql(self.scene_cursor_color, cursor_color);
+        if (cursor_changed) {
+            self.markCursorRow(self.scene_cursor);
+            self.markCursorRow(cursor);
+        }
+
+        self.scene_cols = cols;
+        self.scene_row_count = rows;
+        self.scene_cell_width = cell_width;
+        self.scene_cell_height = cell_height;
+        self.scene_padding = padding;
+        self.scene_cursor = cursor;
+        self.scene_cursor_color = cursor_color;
+        self.scene_clear = clear;
+        self.scene_invalid = false;
+
+        for (self.dirty_rows, 0..) |dirty, row| {
+            if (dirty) try self.rebuildRow(@intCast(row));
+        }
+        try self.rebuildCursor();
+        try self.flattenScene();
+    }
+
+    fn resizeScene(self: *Renderer, cols: u16, rows: u16) RendererError!void {
+        const cell_count = std.math.mul(usize, cols, rows) catch return error.OutOfMemory;
+        const next_cells = self.allocator.alloc(font.Cell, cell_count) catch
+            return error.OutOfMemory;
+        errdefer self.allocator.free(next_cells);
+        @memset(next_cells, .{});
+        const next_dirty = self.allocator.alloc(bool, rows) catch return error.OutOfMemory;
+        errdefer self.allocator.free(next_dirty);
+        @memset(next_dirty, true);
+        const next_rows = self.allocator.alloc(SceneRow, rows) catch return error.OutOfMemory;
+        var initialized: usize = 0;
+        errdefer {
+            for (next_rows[0..initialized]) |*row| row.deinit(self.allocator);
+            self.allocator.free(next_rows);
+        }
+        for (next_rows) |*row| {
+            row.* = try SceneRow.init(self.allocator, cols);
+            initialized += 1;
+        }
+
+        if (self.cell_cache.len != 0) self.allocator.free(self.cell_cache);
+        for (self.scene_rows) |*row| row.deinit(self.allocator);
+        if (self.scene_rows.len != 0) self.allocator.free(self.scene_rows);
+        if (self.dirty_rows.len != 0) self.allocator.free(self.dirty_rows);
+        self.cell_cache = next_cells;
+        self.scene_rows = next_rows;
+        self.dirty_rows = next_dirty;
+        self.scene_cols = cols;
+        self.scene_row_count = rows;
+        self.scene_invalid = true;
+    }
+
+    fn markCursorRow(self: *Renderer, cursor: ?font.CursorCell) void {
+        if (cursor) |value| {
+            if (value.y < self.dirty_rows.len) self.dirty_rows[value.y] = true;
+        }
+    }
+
+    fn rebuildRow(self: *Renderer, row_index: u16) RendererError!void {
+        const row = &self.scene_rows[row_index];
+        row.clear();
         const srgb_target = isSrgb(self.format);
-        const limit = @min(cells.len, @as(usize, cols) * @as(usize, rows));
-        for (cells[0..limit], 0..) |*cell, index| {
-            const col: u16 = @intCast(index % @as(usize, cols));
-            const row: u16 = @intCast(index / @as(usize, cols));
-            const x = padding +| @as(u32, col) *| cell_width;
-            const y = padding +| @as(u32, row) *| cell_height;
+        const first = @as(usize, row_index) * @as(usize, self.scene_cols);
+        for (self.cell_cache[first .. first + self.scene_cols], 0..) |*cell, col_index| {
+            const col: u16 = @intCast(col_index);
+            const x = self.scene_padding +| @as(u32, col) *| self.scene_cell_width;
+            const y = self.scene_padding +| @as(u32, row_index) *| self.scene_cell_height;
             var effective_fg = cell.fg;
             var effective_bg = cell.bg;
             if (cell.inverse != cell.selected) {
                 std.mem.swap(config.Rgb, &effective_fg, &effective_bg);
             }
             const foreground_alpha: f32 = if (cell.faint) 0.5 else 1;
-            if (!std.meta.eql(effective_bg, clear)) {
+            if (!std.meta.eql(effective_bg, self.scene_clear)) {
                 try self.appendRect(
-                    &self.rect_before,
+                    &row.rect_before,
                     x,
                     y,
-                    cell_width,
-                    cell_height,
+                    self.scene_cell_width,
+                    self.scene_cell_height,
                     effective_bg,
                     srgb_target,
                 );
             }
-            const cursor_here = if (cursor) |value| value.x == col and value.y == row else false;
-            const block_cursor = cursor_here and cursor.?.style == 0;
+            const cursor_here = if (self.scene_cursor) |value|
+                value.x == col and value.y == row_index
+            else
+                false;
+            const block_cursor = cursor_here and self.scene_cursor.?.style == 0;
             if (block_cursor) {
                 try self.appendRect(
-                    &self.rect_before,
+                    &row.rect_before,
                     x,
                     y,
-                    cell_width,
-                    cell_height,
-                    cursor_color,
+                    self.scene_cell_width,
+                    self.scene_cell_height,
+                    self.scene_cursor_color,
                     srgb_target,
                 );
             }
 
             if (!cell.invisible and cell.underline != 0) {
                 try self.appendUnderline(
+                    &row.rect_before,
                     x,
                     y,
-                    cell_width,
-                    cell_height,
+                    self.scene_cell_width,
+                    self.scene_cell_height,
                     cell.underline,
                     cell.underline_color,
                     foreground_alpha,
@@ -442,7 +605,7 @@ pub const Renderer = struct {
             if (!cell.invisible and cell.codepoint != 0 and cell.codepoint != ' ' and cell.span != 0) {
                 if (try self.findOrCreateGlyph(cell)) |glyph| {
                     const glyph_color = if (block_cursor) effective_bg else effective_fg;
-                    try self.glyph_instances.append(self.allocator, .{
+                    row.glyphs.append(self.allocator, .{
                         .rect = glyphPixelRect(
                             x,
                             y,
@@ -461,16 +624,16 @@ pub const Renderer = struct {
                             0,
                             0,
                         },
-                    });
+                    }) catch return error.OutOfMemory;
                 }
             }
             if (!cell.invisible and cell.overline) {
                 try self.appendRectAlpha(
-                    &self.rect_after,
+                    &row.rect_after,
                     x,
                     y,
-                    cell_width,
-                    @max(1, cell_height / 16),
+                    self.scene_cell_width,
+                    @max(1, self.scene_cell_height / 16),
                     effective_fg,
                     foreground_alpha,
                     srgb_target,
@@ -478,54 +641,74 @@ pub const Renderer = struct {
             }
             if (!cell.invisible and cell.strikethrough) {
                 try self.appendRectAlpha(
-                    &self.rect_after,
+                    &row.rect_after,
                     x,
-                    y + cell_height / 2,
-                    cell_width,
-                    @max(1, cell_height / 16),
+                    y + self.scene_cell_height / 2,
+                    self.scene_cell_width,
+                    @max(1, self.scene_cell_height / 16),
                     effective_fg,
                     foreground_alpha,
                     srgb_target,
                 );
             }
         }
+    }
 
-        if (cursor) |value| {
-            const x = padding +| @as(u32, value.x) *| cell_width;
-            const y = padding +| @as(u32, value.y) *| cell_height;
+    fn rebuildCursor(self: *Renderer) RendererError!void {
+        self.cursor_rects.clearRetainingCapacity();
+        const srgb_target = isSrgb(self.format);
+        if (self.scene_cursor) |value| {
+            const x = self.scene_padding +| @as(u32, value.x) *| self.scene_cell_width;
+            const y = self.scene_padding +| @as(u32, value.y) *| self.scene_cell_height;
             switch (value.style) {
                 1 => try self.appendRect(
-                    &self.rect_after,
+                    &self.cursor_rects,
                     x,
                     y,
-                    @max(2, cell_width / 6),
-                    cell_height,
-                    cursor_color,
+                    @max(2, self.scene_cell_width / 6),
+                    self.scene_cell_height,
+                    self.scene_cursor_color,
                     srgb_target,
                 ),
                 2 => {
-                    const thickness = @max(2, cell_height / 8);
+                    const thickness = @max(2, self.scene_cell_height / 8);
                     try self.appendRect(
-                        &self.rect_after,
+                        &self.cursor_rects,
                         x,
-                        y + cell_height -| thickness,
-                        cell_width,
+                        y + self.scene_cell_height -| thickness,
+                        self.scene_cell_width,
                         thickness,
-                        cursor_color,
+                        self.scene_cursor_color,
                         srgb_target,
                     );
                 },
                 3 => {
                     const thickness: u32 = 2;
-                    try self.appendRect(&self.rect_after, x, y, cell_width, thickness, cursor_color, srgb_target);
-                    try self.appendRect(&self.rect_after, x, y + cell_height -| thickness, cell_width, thickness, cursor_color, srgb_target);
-                    try self.appendRect(&self.rect_after, x, y, thickness, cell_height, cursor_color, srgb_target);
-                    try self.appendRect(&self.rect_after, x + cell_width -| thickness, y, thickness, cell_height, cursor_color, srgb_target);
+                    try self.appendRect(&self.cursor_rects, x, y, self.scene_cell_width, thickness, self.scene_cursor_color, srgb_target);
+                    try self.appendRect(&self.cursor_rects, x, y + self.scene_cell_height -| thickness, self.scene_cell_width, thickness, self.scene_cursor_color, srgb_target);
+                    try self.appendRect(&self.cursor_rects, x, y, thickness, self.scene_cell_height, self.scene_cursor_color, srgb_target);
+                    try self.appendRect(&self.cursor_rects, x + self.scene_cell_width -| thickness, y, thickness, self.scene_cell_height, self.scene_cursor_color, srgb_target);
                 },
                 else => {},
             }
         }
+    }
 
+    fn flattenScene(self: *Renderer) RendererError!void {
+        self.rect_before.clearRetainingCapacity();
+        self.rect_after.clearRetainingCapacity();
+        self.rect_instances.clearRetainingCapacity();
+        self.glyph_instances.clearRetainingCapacity();
+        for (self.scene_rows) |*row| {
+            self.rect_before.appendSlice(self.allocator, row.rect_before.items) catch
+                return error.OutOfMemory;
+            self.glyph_instances.appendSlice(self.allocator, row.glyphs.items) catch
+                return error.OutOfMemory;
+            self.rect_after.appendSlice(self.allocator, row.rect_after.items) catch
+                return error.OutOfMemory;
+        }
+        self.rect_after.appendSlice(self.allocator, self.cursor_rects.items) catch
+            return error.OutOfMemory;
         try self.rect_instances.appendSlice(self.allocator, self.rect_before.items);
         try self.rect_instances.appendSlice(self.allocator, self.rect_after.items);
     }
@@ -565,6 +748,7 @@ pub const Renderer = struct {
 
     fn appendUnderline(
         self: *Renderer,
+        list: *std.ArrayList(RectInstance),
         x: u32,
         y: u32,
         width: u32,
@@ -578,8 +762,8 @@ pub const Renderer = struct {
         const baseline = y + height -| @max(2, height / 10);
         switch (style) {
             2 => {
-                try self.appendRectAlpha(&self.rect_before, x, baseline -| thickness * 2, width, thickness, color, alpha, srgb_target);
-                try self.appendRectAlpha(&self.rect_before, x, baseline, width, thickness, color, alpha, srgb_target);
+                try self.appendRectAlpha(list, x, baseline -| thickness * 2, width, thickness, color, alpha, srgb_target);
+                try self.appendRectAlpha(list, x, baseline, width, thickness, color, alpha, srgb_target);
             },
             3 => {
                 const segment = @max(2, thickness * 2);
@@ -587,7 +771,7 @@ pub const Renderer = struct {
                 var up = false;
                 while (offset < width) : (offset += segment) {
                     try self.appendRectAlpha(
-                        &self.rect_before,
+                        list,
                         x + offset,
                         baseline -| if (up) thickness else 0,
                         @min(segment, width - offset),
@@ -603,17 +787,17 @@ pub const Renderer = struct {
                 const dot = @max(1, thickness);
                 var offset: u32 = 0;
                 while (offset < width) : (offset += dot * 2) {
-                    try self.appendRectAlpha(&self.rect_before, x + offset, baseline, @min(dot, width - offset), thickness, color, alpha, srgb_target);
+                    try self.appendRectAlpha(list, x + offset, baseline, @min(dot, width - offset), thickness, color, alpha, srgb_target);
                 }
             },
             5 => {
                 const dash = @max(3, width / 3);
                 var offset: u32 = 0;
                 while (offset < width) : (offset += dash + thickness) {
-                    try self.appendRectAlpha(&self.rect_before, x + offset, baseline, @min(dash, width - offset), thickness, color, alpha, srgb_target);
+                    try self.appendRectAlpha(list, x + offset, baseline, @min(dash, width - offset), thickness, color, alpha, srgb_target);
                 }
             },
-            else => try self.appendRectAlpha(&self.rect_before, x, baseline, width, thickness, color, alpha, srgb_target),
+            else => try self.appendRectAlpha(list, x, baseline, width, thickness, color, alpha, srgb_target),
         }
     }
 

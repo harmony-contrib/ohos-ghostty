@@ -15,7 +15,7 @@ pub fn build(b: *std.Build) !void {
         "optimize",
         "Prioritize performance, safety, or binary size (defaults to ReleaseFast)",
     ) orelse .ReleaseFast;
-    const api = ohos_binding_build.apiOption(b) orelse ohos_binding_build.default_api;
+    const api = ohos_binding_build.apiOption(b) orelse 20;
 
     const zig_napi = b.dependency("zig-napi", .{});
     const napi = zig_napi.module("napi");
@@ -29,7 +29,7 @@ pub fn build(b: *std.Build) !void {
 
     if (native) {
         const result = try napi_build.nativeAddonBuild(b, .{
-            .name = "terminal",
+            .name = "ghost_terminal",
             .root_module_options = .{
                 .root_source_file = b.path("src/lib.zig"),
                 .target = target,
@@ -43,16 +43,16 @@ pub fn build(b: *std.Build) !void {
 
         const dist = b.addUpdateSourceFiles();
         if (result.arm64) |arm64| {
-            dist.addCopyFileToSource(arm64.getEmittedBin(), "package/libs/arm64-v8a/libterminal.so");
-            dist.addCopyFileToSource(arm64.getEmittedBin(), "example/libs/arm64-v8a/libterminal.so");
+            dist.addCopyFileToSource(arm64.getEmittedBin(), "package/libs/arm64-v8a/libghost_terminal.so");
+            dist.addCopyFileToSource(arm64.getEmittedBin(), "example/libs/arm64-v8a/libghost_terminal.so");
         }
         if (result.arm) |arm| {
-            dist.addCopyFileToSource(arm.getEmittedBin(), "package/libs/armeabi-v7a/libterminal.so");
-            dist.addCopyFileToSource(arm.getEmittedBin(), "example/libs/armeabi-v7a/libterminal.so");
+            dist.addCopyFileToSource(arm.getEmittedBin(), "package/libs/armeabi-v7a/libghost_terminal.so");
+            dist.addCopyFileToSource(arm.getEmittedBin(), "example/libs/armeabi-v7a/libghost_terminal.so");
         }
         if (result.x64) |x64| {
-            dist.addCopyFileToSource(x64.getEmittedBin(), "package/libs/x86_64/libterminal.so");
-            dist.addCopyFileToSource(x64.getEmittedBin(), "example/libs/x86_64/libterminal.so");
+            dist.addCopyFileToSource(x64.getEmittedBin(), "package/libs/x86_64/libghost_terminal.so");
+            dist.addCopyFileToSource(x64.getEmittedBin(), "example/libs/x86_64/libghost_terminal.so");
         }
         const dist_step = b.step("dist", "Install the Zig-built addon into the HAR and example modules");
         dist_step.dependOn(&dist.step);
@@ -79,6 +79,13 @@ pub fn build(b: *std.Build) !void {
             .optimize = optimize,
         }),
     });
+    const paint_packet_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/paint_packet.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+        }),
+    });
     const ghostty_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/ghostty_test.zig"),
@@ -94,6 +101,7 @@ pub fn build(b: *std.Build) !void {
     test_step.dependOn(&b.addRunArtifact(font_tests).step);
     test_step.dependOn(&b.addRunArtifact(layout_tests).step);
     test_step.dependOn(&b.addRunArtifact(byte_queue_tests).step);
+    test_step.dependOn(&b.addRunArtifact(paint_packet_tests).step);
     test_step.dependOn(&b.addRunArtifact(ghostty_tests).step);
 }
 
@@ -125,6 +133,7 @@ fn configureAddon(
     compile.root_module.addImport("xcomponent", ohos_binding.module("xcomponent"));
     compile.root_module.addImport("hilog", ohos_binding.module("hilog"));
     compile.root_module.addImport("native_window", ohos_binding.module("native_window"));
+    compile.root_module.addImport("native_vsync", ohos_binding.module("native_vsync"));
     compile.root_module.addImport("native_drawing", ohos_binding.module("native_drawing"));
     compile.root_module.addImport("input_method", ohos_binding.module("input_method"));
     compile.root_module.addImport("wgpu", wgpu);
